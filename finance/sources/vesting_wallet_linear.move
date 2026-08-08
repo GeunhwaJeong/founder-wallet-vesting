@@ -1,0 +1,546 @@
+/// The stepped (tranche) schedule for `vesting_wallet` - the "1/N every period,
+/// after an optional cliff" curve that dominates real token grants, with continuous
+/// linear-with-cliff vesting available as its `period_ms = 1` limit.
+///
+/// This module declares the `Linear` witness and its `Params`, plus the full
+/// integrator API around them (`params` / `params_continuous` / `new` /
+/// `new_continuous` / `vested_amount` / `release` / `destroy` and friends). It
+/// implements the curve on top of the curve-agnostic `vesting_wallet` primitive:
+/// `params` validates and builds a tranche schedule (`period_ms`, `steps`), `new` is
+/// sugar that hands that `Params` to `vesting_wallet::new`, and `params_continuous` /
+/// `new_continuous` are the continuous linear (`period_ms = 1`) analogs. An integrator
+/// who wants the wallet built for them touches only this module - they never construct
+/// a bare wallet or mint a `VestedAmount` by hand. A curve-agnostic protocol that
+/// drives the bare `vesting_wallet` primitive itself takes only `params` and mints the
+/// wallet on its own (see "Why a separate module").
+///
+/// # Why a separate module
+///
+/// Struct fields are module-private in Move, so only this module can construct a
+/// `Linear` witness, and therefore only this module can mint a
+/// `VestedAmount<Linear>` (via `vesting_wallet::mint_vested_amount`, which takes
+/// the `Linear` witness) - the operation that confers curve authority. See
+/// `vesting_wallet`'s docs for the full rationale.
+///
+/// The public `params` constructor is the seam this gives an external protocol: it
+/// hands out a *validated* `Params` without surrendering the witness, so a
+/// curve-agnostic wrapper can call `vesting_wallet::new<Linear, Params, C>` itself -
+/// choosing its own topology and nesting - while curve evaluation and teardown, which
+/// need `Linear`, stay gated to this module.
+///
+/// # The curve
+///
+/// Funds unlock in `steps` equal tranches, one every `period_ms`, so the schedule
+/// runs for `period_ms * steps` and ends at `start_ms + period_ms * steps`.
+/// `new_continuous` is the `period_ms = 1` limit, where every millisecond is its own
+/// tranche and the staircase collapses to a straight line.
+///
+/// - Pre-start (`now < start_ms`): zero.
+/// - Pre-cliff (`cliff_ms > 0` and `now < start_ms + cliff_ms`): zero. The cliff
+///   *gates* the staircase; it does not shift it. At the cliff boundary the curve
+///   jumps straight to the value for however many full periods have already elapsed
+///   - so a cliff longer than one period releases several tranches at once as a
+///   catch-up, then resumes its regular cadence.
+/// - Mid-schedule: a staircase. With `k` full periods elapsed
+///   (`k = (now - start_ms) / period_ms`, `0 <= k < steps`), the cumulative vested
+///   total is `total * k / steps`, with the product evaluated in a wider integer
+///   (u256) before the floor division. The value is flat across a period and steps
+///   up at each boundary.
+/// - Post-end: clamped to the wallet's total (`balance + released`).
+///
+/// The total is re-derived on every call from `balance + released`, so deposits
+/// made at `t > start_ms` immediately participate at the current step proportion.
+module openzeppelin_finance::vesting_wallet_linear;
+
+use openzeppelin_finance::vesting_wallet::{
+    Self,
+    VestingWallet,
+    VestingSchedule,
+    VestedAmount,
+    DestroyReceipt,
+    DestroyCap,
+};
+use openzeppelin_math::rounding;
+use openzeppelin_math::u64::mul_div;
+use haneul::clock::Clock;
+
+// === Errors ===
+
+/// `period_ms` was zero; each tranche must span a positive period.
+#[error(code = 0)]
+const EZeroPeriod: vector<u8> = "Period must be greater than zero";
+
+/// `steps` was zero; a schedule must have at least one tranche.
+#[error(code = 1)]
+const EZeroSteps: vector<u8> = "Steps must be greater than zero";
+
+/// `cliff_ms` exceeded the schedule duration (`period_ms * steps`); the cliff must
+/// fall within the schedule.
+#[error(code = 2)]
+const EInvalidCliff: vector<u8> = "Cliff must not exceed duration";
+
+/// `period_ms * steps`, or `start_ms` plus that duration, would overflow `u64`.
+#[error(code = 3)]
+const EScheduleOverflow: vector<u8> = "Schedule end (start + period * steps) would overflow u64";
+
+/// `destroy` was called before the schedule's end (`start_ms + period_ms * steps`).
+#[error(code = 4)]
+const ENotEnded: vector<u8> = "Schedule has not ended yet";
+
+// === Structs ===
+
+/// The schedule witness for the stepped curve. Empty and `drop`-only: it carries no
+/// data and exists solely as the authority token `vesting_wallet` requires.
+/// Declared here, so only this module can construct a `Linear` and therefore only
+/// this module can mint a `VestedAmount<Linear>` or tear down a
+/// `VestingWallet<Linear, Params, C>`.
+public struct Linear has drop {}
+
+/// The stepped-schedule parameters, stored in the wallet.
+public struct Params has copy, drop, store {
+    /// Timestamp (ms) at which vesting begins. Before this, zero is vested.
+    start_ms: u64,
+    /// Length of each tranche period (ms); a new step unlocks every `period_ms`.
+    period_ms: u64,
+    /// Number of equal tranches; the schedule ends at `start_ms + period_ms * steps`.
+    steps: u64,
+    /// Cliff length (ms from `start_ms`); `0` means no cliff. Nothing vests until
+    /// `start_ms + cliff_ms`, at which point the curve jumps to the staircase value
+    /// for the periods elapsed so far.
+    cliff_ms: u64,
+}
+
+// === Public Functions ===
+
+// === Constructors ===
+
+/// Build a validated `Params` value for the stepped (tranche) schedule, running the
+/// same construction guards as `new`. This is the only way to obtain a `Params`
+/// outside this module (its fields are module-private), so a curve-agnostic protocol
+/// that drives the bare `vesting_wallet` primitive directly can mint the wallet
+/// itself - `vesting_wallet::new<Linear, Params, C>(params(..), beneficiary, ctx)` -
+/// without routing wallet creation through this module's `new`. `new` is sugar over
+/// exactly this path.
+///
+/// #### Parameters
+/// - `start_ms`: Timestamp (ms) at which vesting begins.
+/// - `cliff_ms`: Cliff length (ms from `start_ms`); `0` for no cliff.
+/// - `period_ms`: Length of each tranche period (ms).
+/// - `steps`: Number of equal tranches.
+///
+/// #### Returns
+/// - A validated `Params` for the stepped schedule.
+///
+/// #### Aborts
+/// - `EZeroPeriod` if `period_ms == 0`.
+/// - `EZeroSteps` if `steps == 0`.
+/// - `EScheduleOverflow` if `period_ms * steps`, or `start_ms` plus that duration,
+///   would overflow `u64`.
+/// - `EInvalidCliff` if `cliff_ms > period_ms * steps`.
+public fun params(start_ms: u64, cliff_ms: u64, period_ms: u64, steps: u64): Params {
+    assert!(period_ms > 0, EZeroPeriod);
+    assert!(steps > 0, EZeroSteps);
+
+    let max = std::u64::max_value!();
+    assert!(period_ms <= max / steps, EScheduleOverflow);
+    let duration = period_ms * steps;
+    assert!(cliff_ms <= duration, EInvalidCliff);
+    assert!(duration <= max - start_ms, EScheduleOverflow);
+
+    Params { start_ms, period_ms, steps, cliff_ms }
+}
+
+/// Build a validated `Params` value for the continuous linear-with-cliff schedule:
+/// the stepped curve in the `period_ms = 1` limit (`steps = duration_ms`). The
+/// `params_continuous`-to-`params` relationship mirrors `new_continuous`-to-`new`, so
+/// a curve-agnostic protocol can drive `vesting_wallet::new` with a continuous
+/// schedule without routing through this module's `new_continuous`.
+///
+/// #### Parameters
+/// - `start_ms`: Timestamp (ms) at which vesting begins.
+/// - `cliff_ms`: Cliff length (ms from `start_ms`); `0` for no cliff.
+/// - `duration_ms`: Length of the vesting period (ms).
+///
+/// #### Returns
+/// - A validated `Params` for the continuous linear schedule.
+///
+/// #### Aborts
+/// - `EZeroSteps` if `duration_ms == 0`.
+/// - `EInvalidCliff` if `cliff_ms > duration_ms`.
+/// - `EScheduleOverflow` if `start_ms + duration_ms` would overflow `u64`.
+public fun params_continuous(start_ms: u64, cliff_ms: u64, duration_ms: u64): Params {
+    // The continuous curve is the stepped curve with one tranche per millisecond.
+    // A zero `duration_ms` becomes zero `steps`, so `params` rejects it with `EZeroSteps`.
+    params(start_ms, cliff_ms, 1, duration_ms)
+}
+
+/// Bundle a validated stepped `Params` with the `Linear` witness into a
+/// `VestingSchedule<Linear, Params>`. This is the raw-input constructor for such a
+/// bundle (see also `vesting_schedule_continuous` and `into_vesting_schedule`); since
+/// only this module can construct the `Linear` witness, a consumer that accepts the
+/// bundle is guaranteed the witness and params come from this curve. Use
+/// it to configure a curve-agnostic consumer (e.g. a sale's vesting policy) that pins
+/// both the witness and params type arguments and must keep them coherent.
+///
+/// #### Parameters
+/// - `start_ms`: Timestamp (ms) at which vesting begins.
+/// - `cliff_ms`: Cliff length (ms from `start_ms`); `0` for no cliff.
+/// - `period_ms`: Length of each tranche period (ms).
+/// - `steps`: Number of equal tranches.
+///
+/// #### Returns
+/// - A `VestingSchedule<Linear, Params>` carrying the validated stepped schedule.
+///
+/// #### Aborts
+/// - `EZeroPeriod` if `period_ms == 0`.
+/// - `EZeroSteps` if `steps == 0`.
+/// - `EScheduleOverflow` if `period_ms * steps`, or `start_ms` plus that duration,
+///   would overflow `u64`.
+/// - `EInvalidCliff` if `cliff_ms > period_ms * steps`.
+public fun vesting_schedule(
+    start_ms: u64,
+    cliff_ms: u64,
+    period_ms: u64,
+    steps: u64,
+): VestingSchedule<Linear, Params> {
+    vesting_wallet::new_schedule(Linear {}, params(start_ms, cliff_ms, period_ms, steps))
+}
+
+/// Continuous (`period_ms = 1`) analog of `vesting_schedule`: bundle a validated
+/// continuous `Params` with the `Linear` witness. See `vesting_schedule` for how the
+/// bundle keeps a consumer's witness and params type arguments coherent.
+///
+/// #### Parameters
+/// - `start_ms`: Timestamp (ms) at which vesting begins.
+/// - `cliff_ms`: Cliff length (ms from `start_ms`); `0` for no cliff.
+/// - `duration_ms`: Length of the vesting period (ms).
+///
+/// #### Returns
+/// - A `VestingSchedule<Linear, Params>` carrying the validated continuous schedule.
+///
+/// #### Aborts
+/// - `EZeroSteps` if `duration_ms == 0`.
+/// - `EInvalidCliff` if `cliff_ms > duration_ms`.
+/// - `EScheduleOverflow` if `start_ms + duration_ms` would overflow `u64`.
+public fun vesting_schedule_continuous(
+    start_ms: u64,
+    cliff_ms: u64,
+    duration_ms: u64,
+): VestingSchedule<Linear, Params> {
+    vesting_wallet::new_schedule(Linear {}, params_continuous(start_ms, cliff_ms, duration_ms))
+}
+
+/// Wrap an already-built `Params` into a `VestingSchedule<Linear, Params>`. Where
+/// `vesting_schedule` validates and bundles in one step, this bundles a `Params` you
+/// already hold - e.g. one read back from a wallet via `vesting_wallet::schedule_params`,
+/// or produced by `params` / `params_continuous`. It is the inverse of the bundle's
+/// `vesting_wallet::params` accessor. No revalidation is needed: a `Params` can only be
+/// obtained from this module's validating constructors, so it is already well-formed;
+/// and since only this module can supply the `Linear` witness, the resulting
+/// `(Linear, Params)` pair is coherent by construction.
+///
+/// #### Parameters
+/// - `params`: The stepped-schedule parameters to bundle.
+///
+/// #### Returns
+/// - A `VestingSchedule<Linear, Params>` carrying `params`.
+public fun into_vesting_schedule(params: Params): VestingSchedule<Linear, Params> {
+    vesting_wallet::new_schedule(Linear {}, params)
+}
+
+/// Build a `VestingWallet<Linear, Params, C>` on the stepped (tranche) schedule.
+/// Returns the wallet by value, plus the `DestroyCap` that authorizes its teardown, so
+/// the caller can chain deposit and topology selection in one PTB and route the cap to
+/// wherever teardown authority should live. Use `create_and_share` for the common "share
+/// immediately" case.
+///
+/// #### Parameters
+/// - `beneficiary`: Address that every release pays out to.
+/// - `start_ms`: Timestamp (ms) at which vesting begins.
+/// - `cliff_ms`: Cliff length (ms from `start_ms`); `0` for no cliff.
+/// - `period_ms`: Length of each tranche period (ms).
+/// - `steps`: Number of equal tranches.
+/// - `ctx`: Transaction context.
+///
+/// #### Returns
+/// - A fresh, unfunded `VestingWallet<Linear, Params, C>` owned by the caller.
+/// - The `DestroyCap` bound to that wallet, required later by `destroy`.
+///
+/// #### Aborts
+/// - `EZeroPeriod` if `period_ms == 0`.
+/// - `EZeroSteps` if `steps == 0`.
+/// - `EScheduleOverflow` if `period_ms * steps`, or `start_ms` plus that duration,
+///   would overflow `u64`.
+/// - `EInvalidCliff` if `cliff_ms > period_ms * steps`.
+public fun new<C>(
+    beneficiary: address,
+    start_ms: u64,
+    cliff_ms: u64,
+    period_ms: u64,
+    steps: u64,
+    ctx: &mut TxContext,
+): (VestingWallet<Linear, Params, C>, DestroyCap) {
+    vesting_wallet::new(params(start_ms, cliff_ms, period_ms, steps), beneficiary, ctx)
+}
+
+/// Sugar for a continuous linear-with-cliff schedule: the stepped curve in the
+/// `period_ms = 1` limit (`steps = duration_ms`), where every millisecond is its own
+/// tranche and the curve rises linearly. Use `new` directly for coarser tranches.
+/// Returns the wallet by value plus its `DestroyCap`; use `create_and_share` for the
+/// common "share immediately" case.
+///
+/// #### Parameters
+/// - `beneficiary`: Address that every release pays out to.
+/// - `start_ms`: Timestamp (ms) at which vesting begins.
+/// - `cliff_ms`: Cliff length (ms from `start_ms`); `0` for no cliff.
+/// - `duration_ms`: Length of the vesting period (ms).
+/// - `ctx`: Transaction context.
+///
+/// #### Returns
+/// - A fresh, unfunded `VestingWallet<Linear, Params, C>` owned by the caller.
+/// - The `DestroyCap` bound to that wallet, required later by `destroy`.
+///
+/// #### Aborts
+/// - `EZeroSteps` if `duration_ms == 0`.
+/// - `EInvalidCliff` if `cliff_ms > duration_ms`.
+/// - `EScheduleOverflow` if `start_ms + duration_ms` would overflow `u64`.
+public fun new_continuous<C>(
+    beneficiary: address,
+    start_ms: u64,
+    cliff_ms: u64,
+    duration_ms: u64,
+    ctx: &mut TxContext,
+): (VestingWallet<Linear, Params, C>, DestroyCap) {
+    vesting_wallet::new(params_continuous(start_ms, cliff_ms, duration_ms), beneficiary, ctx)
+}
+
+/// Sugar for the common case: build a stepped wallet and immediately share it via
+/// `transfer::public_share_object`, returning the shared wallet's `ID` (so the caller
+/// can reference it once it is no longer held by value) and its `DestroyCap` for the
+/// caller to route wherever teardown authority should live (held, forwarded, or
+/// wrapped) - whoever ends up holding the cap can later tear the wallet down.
+///
+/// #### Parameters
+/// - `beneficiary`: Address that every release pays out to.
+/// - `start_ms`: Timestamp (ms) at which vesting begins.
+/// - `cliff_ms`: Cliff length (ms from `start_ms`); `0` for no cliff.
+/// - `period_ms`: Length of each tranche period (ms).
+/// - `steps`: Number of equal tranches.
+/// - `ctx`: Transaction context.
+///
+/// #### Returns
+/// - The shared wallet's `ID`.
+/// - The shared wallet's `DestroyCap`, required later by `destroy`.
+///
+/// #### Aborts
+/// - `EZeroPeriod` if `period_ms == 0`.
+/// - `EZeroSteps` if `steps == 0`.
+/// - `EScheduleOverflow` if `period_ms * steps`, or `start_ms` plus that duration,
+///   would overflow `u64`.
+/// - `EInvalidCliff` if `cliff_ms > period_ms * steps`.
+public fun create_and_share<C>(
+    beneficiary: address,
+    start_ms: u64,
+    cliff_ms: u64,
+    period_ms: u64,
+    steps: u64,
+    ctx: &mut TxContext,
+): (ID, DestroyCap) {
+    let (wallet, cap) = new<C>(beneficiary, start_ms, cliff_ms, period_ms, steps, ctx);
+    let wallet_id = object::id(&wallet);
+    transfer::public_share_object(wallet);
+    (wallet_id, cap)
+}
+
+/// Sugar for the common case: build a continuous wallet and immediately share it via
+/// `transfer::public_share_object`, returning the shared wallet's `ID` and its
+/// `DestroyCap` for the caller to route wherever teardown authority should live.
+///
+/// #### Parameters
+/// - `beneficiary`: Address that every release pays out to.
+/// - `start_ms`: Timestamp (ms) at which vesting begins.
+/// - `cliff_ms`: Cliff length (ms from `start_ms`); `0` for no cliff.
+/// - `duration_ms`: Length of the vesting period (ms).
+/// - `ctx`: Transaction context.
+///
+/// #### Returns
+/// - The shared wallet's `ID`.
+/// - The shared wallet's `DestroyCap`, required later by `destroy`.
+///
+/// #### Aborts
+/// - `EZeroSteps` if `duration_ms == 0`.
+/// - `EInvalidCliff` if `cliff_ms > duration_ms`.
+/// - `EScheduleOverflow` if `start_ms + duration_ms` would overflow `u64`.
+public fun create_and_share_continuous<C>(
+    beneficiary: address,
+    start_ms: u64,
+    cliff_ms: u64,
+    duration_ms: u64,
+    ctx: &mut TxContext,
+): (ID, DestroyCap) {
+    let (wallet, cap) = new_continuous<C>(beneficiary, start_ms, cliff_ms, duration_ms, ctx);
+    let wallet_id = object::id(&wallet);
+    transfer::public_share_object(wallet);
+    (wallet_id, cap)
+}
+
+// === Curve evaluation & release ===
+
+/// Evaluate the stepped curve at `clock.timestamp_ms()` and mint the resulting
+/// cumulative vested total as a `VestedAmount<Linear>`. See the module docs for the
+/// piecewise curve definition.
+///
+/// #### Parameters
+/// - `wallet`: The wallet whose curve to evaluate.
+/// - `clock`: Sui `Clock`, read for the current timestamp.
+///
+/// #### Returns
+/// - A `VestedAmount<Linear>` for `wallet` at the current clock, ready to pass to
+///   `vesting_wallet::release` (or this module's `release`).
+public fun vested_amount<C>(
+    wallet: &VestingWallet<Linear, Params, C>,
+    clock: &Clock,
+): VestedAmount<Linear> {
+    wallet.mint_vested_amount(
+        Linear {},
+        vested_amount_raw(wallet, clock),
+    )
+}
+
+/// Evaluate the stepped curve and release the not-yet-released portion in one
+/// call - the common path for the stepped schedule. If nothing new has vested since
+/// the last release, the call is a no-op.
+///
+/// #### Parameters
+/// - `wallet`: The wallet to release from.
+/// - `clock`: Sui `Clock`, read for the current timestamp.
+public fun release<C>(wallet: &mut VestingWallet<Linear, Params, C>, clock: &Clock) {
+    let v = vested_amount(wallet, clock);
+    wallet.release(&v);
+}
+
+/// How much `release` would pay out right now, without the caller minting a
+/// `VestedAmount`. The client-friendly "what can I claim?" query.
+///
+/// #### Parameters
+/// - `wallet`: The wallet to query.
+/// - `clock`: Sui `Clock`, read for the current timestamp.
+///
+/// #### Returns
+/// - The amount currently releasable to the beneficiary at `clock.timestamp_ms()`.
+public fun releasable<C>(wallet: &VestingWallet<Linear, Params, C>, clock: &Clock): u64 {
+    wallet.releasable(&vested_amount(wallet, clock))
+}
+
+/// Finalize teardown of a drained, ended `Linear` wallet by consuming the
+/// `DestroyReceipt<Linear, Params>` that `vesting_wallet::destroy_empty` returns, along
+/// with the wallet's `DestroyCap`. `destroy_empty` is permissionless and is what
+/// actually reclaims the storage rebate; this call is the gated other half - only this
+/// module holds `Linear`, so only it can unwrap the receipt - and it additionally
+/// requires the schedule to have ended. Because the receipt is a hot potato consumed in
+/// the same PTB that produced it, a failed gate here (or in the core cap check) aborts
+/// and reverts the whole teardown, including the `destroy_empty` call.
+///
+/// Authority comes from the `cap`, not the caller's address: whoever holds the wallet's
+/// `DestroyCap` may tear it down. This is what lets a wallet whose `beneficiary` is an
+/// object address be torn down at all - an object address is never a `ctx.sender()`, so
+/// the previous "only the beneficiary may destroy" gate could never be satisfied for it.
+/// The cap holder bears the strand risk the old beneficiary gate guarded. A coin
+/// `public_transfer`'d to the wallet's address but not yet `receive_and_deposit`'d is
+/// invisible to the held-balance check, and settled address-balance funds must be swept
+/// before `destroy_empty` accepts the teardown. Newly settled third-party funds can make
+/// `destroy_empty` abort with `EUnsweptFunds`, so teardown should be treated as
+/// retryable: sweep and retry.
+///
+/// Route the cap to the party that should own that decision (commonly the beneficiary or
+/// its controller). Destruction is an operational step rather than a guaranteed one-shot:
+/// halt upstream emissions first, claim any transferred coins that already target the
+/// wallet, sweep settled funds, and allow at least one full checkpoint for in-flight
+/// emissions to become visible before retrying teardown. Funds sent in the same
+/// checkpoint as teardown may be invisible to `destroy_empty`; if the wallet `UID` is
+/// deleted before they settle, they can be permanently stranded.
+///
+/// The ended gate is retained: it stops a wallet being torn down ahead of a scheduled
+/// future deposit, front-running funding intended to arrive later. It cannot detect
+/// coins already sent to the wallet's address but still unclaimed by the wallet.
+///
+/// #### Parameters
+/// - `receipt`: The `DestroyReceipt<Linear, Params>` returned by
+///   `vesting_wallet::destroy_empty`.
+/// - `cap`: The wallet's `DestroyCap`, minted by `new`. Consumed by the call.
+/// - `clock`: Sui `Clock`, used to check the schedule has ended.
+///
+/// #### Aborts
+/// - `EWrongCap` if `cap` was minted for a different wallet.
+/// - `ENotEnded` if called before the schedule's end (`start_ms + period_ms * steps`).
+public fun destroy(receipt: DestroyReceipt<Linear, Params>, cap: DestroyCap, clock: &Clock) {
+    let params = receipt.consume_receipt(cap, Linear {});
+
+    assert!(clock.timestamp_ms() >= params.calculate_end(), ENotEnded);
+}
+
+// === View helpers ===
+
+/// Timestamp (ms) at which vesting begins.
+public fun start_ms<C>(wallet: &VestingWallet<Linear, Params, C>): u64 {
+    wallet.schedule_params().start_ms
+}
+
+/// Length of each tranche period (ms).
+public fun period_ms<C>(wallet: &VestingWallet<Linear, Params, C>): u64 {
+    wallet.schedule_params().period_ms
+}
+
+/// Number of equal tranches.
+public fun steps<C>(wallet: &VestingWallet<Linear, Params, C>): u64 {
+    wallet.schedule_params().steps
+}
+
+/// Length of the vesting period (ms): `period_ms * steps`.
+public fun duration_ms<C>(wallet: &VestingWallet<Linear, Params, C>): u64 {
+    let params = wallet.schedule_params();
+    params.period_ms * params.steps
+}
+
+/// Timestamp (ms) at which the schedule ends (`start_ms + period_ms * steps`).
+public fun end_ms<C>(wallet: &VestingWallet<Linear, Params, C>): u64 {
+    wallet.schedule_params().calculate_end()
+}
+
+/// Read the configured cliff length (ms from `start_ms`). `0` means no cliff.
+public fun cliff_ms<C>(wallet: &VestingWallet<Linear, Params, C>): u64 {
+    wallet.schedule_params().cliff_ms
+}
+
+// === Private Functions ===
+
+/// The schedule's end timestamp (ms), `start_ms + period_ms * steps`, derived from
+/// `Params` alone so `destroy` can check it after the wallet is already gone.
+fun calculate_end(params: &Params): u64 {
+    params.start_ms + params.period_ms * params.steps
+}
+
+/// The stepped curve's cumulative vested total at the current clock, as a `u64`.
+fun vested_amount_raw<C>(wallet: &VestingWallet<Linear, Params, C>, clock: &Clock): u64 {
+    let now = clock.timestamp_ms();
+    let Params { start_ms, period_ms, steps, cliff_ms } = wallet.schedule_params();
+
+    if (now < start_ms) {
+        0
+    } else if (cliff_ms > 0 && now < start_ms + cliff_ms) {
+        0
+    } else {
+        // SAFETY: depositing has a check ensuring no balance overflow can occur.
+        let total = wallet.balance() + wallet.released();
+        // SAFETY: construction guarantees `period_ms * steps` and `start_ms + period_ms * steps`
+        // fit in u64, so neither arithmetic here overflows.
+        if (now >= start_ms + period_ms * steps) {
+            total
+        } else {
+            let elapsed_steps = (now - start_ms) / period_ms;
+            // SAFETY: `now < start_ms + period_ms * steps`, so `elapsed_steps < steps`:
+            // the staircase value stays strictly below `total` until the post-end clamp.
+            mul_div(total, elapsed_steps, steps, rounding::down()).destroy_some()
+        }
+    }
+}

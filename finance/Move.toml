@@ -1,0 +1,10 @@
+[package]
+name = "openzeppelin_finance"
+edition = "2024"
+
+[environments]
+haneul-mainnet = "a0053d9e"
+local = "a46510c7"
+
+[dependencies]
+openzeppelin_math = { local = "../math" }

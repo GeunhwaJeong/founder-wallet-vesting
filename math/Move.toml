@@ -1,0 +1,7 @@
+[package]
+name = "openzeppelin_math"
+edition = "2024"
+
+[environments]
+haneul-mainnet = "a0053d9e"
+local = "a46510c7"
