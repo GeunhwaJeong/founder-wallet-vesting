@@ -8,7 +8,7 @@ Both packages are **immutable**: their `UpgradeCap`s were burned in the same ses
 
 ## Deployments
 
-Network: **Haneul Mainnet**, chain id `a0053d9e`, public RPC `http://158.69.54.239:9000`
+Network: **Haneul Mainnet**, chain id `a0053d9e`, public gRPC `158.69.54.239:9000`
 
 | Package | Address | Publish tx |
 |---|---|---|
@@ -41,33 +41,33 @@ Properties enforced by the deployed bytecode:
 
 ## Verify it yourself
 
+The commands below use [grpcurl](https://github.com/fullstorydev/grpcurl).
+
 Read the lockup wallet state (balance, released amount, beneficiary, schedule):
 
 ```bash
-curl -s -X POST http://158.69.54.239:9000 -H 'Content-Type: application/json' -d '{
-  "jsonrpc": "2.0", "id": 1, "method": "haneul_getObject",
-  "params": ["0x461c68295d990769c4c602dadceaa2a16a7543b4535e93e16de211c316ad1d17",
-             {"showContent": true, "showOwner": true}]
-}'
+grpcurl -plaintext -d '{
+  "object_id": "0x461c68295d990769c4c602dadceaa2a16a7543b4535e93e16de211c316ad1d17",
+  "read_mask": {"paths": ["owner", "json"]}
+}' 158.69.54.239:9000 haneul.rpc.v2.LedgerService/GetObject
 ```
 
 Confirm the packages are immutable:
 
 ```bash
-curl -s -X POST http://158.69.54.239:9000 -H 'Content-Type: application/json' -d '{
-  "jsonrpc": "2.0", "id": 1, "method": "haneul_getObject",
-  "params": ["0x3167daad32500f2293efbadf6bb8997da35e5ac309aeefce6644e125b48920f3",
-             {"showOwner": true}]
-}'
+grpcurl -plaintext -d '{
+  "object_id": "0x3167daad32500f2293efbadf6bb8997da35e5ac309aeefce6644e125b48920f3",
+  "read_mask": {"paths": ["owner"]}
+}' 158.69.54.239:9000 haneul.rpc.v2.LedgerService/GetObject
 ```
 
-Track cumulative payouts to the beneficiary (the `fundsInAddressBalance` field):
+Track cumulative payouts to the beneficiary (the `addressBalance` field):
 
 ```bash
-curl -s -X POST http://158.69.54.239:9000 -H 'Content-Type: application/json' -d '{
-  "jsonrpc": "2.0", "id": 1, "method": "haneulx_getAllBalances",
-  "params": ["0x804915e146733616462d0aacce820589e2ebfb5f7e4d9af15cce2f1a5ebcb031"]
-}'
+grpcurl -plaintext -d '{
+  "owner": "0x804915e146733616462d0aacce820589e2ebfb5f7e4d9af15cce2f1a5ebcb031",
+  "coin_type": "0x2::haneul::HANEUL"
+}' 158.69.54.239:9000 haneul.rpc.v2.StateService/GetBalance
 ```
 
 ## Mainnet rehearsal
